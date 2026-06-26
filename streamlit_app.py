@@ -1,9 +1,11 @@
 import streamlit as st
 import pickle
 import os
+import glob
 import numpy as np
 import librosa
-import urllib.request
+import kagglehub
+from sklearn.ensemble import RandomForestClassifier
 
 # App Layout configuration
 st.set_page_config(page_title="Deepfake Voice Detector", page_icon="🎙️", layout="centered")
@@ -13,26 +15,8 @@ st.write("Upload an audio sample below to verify if the speech is authentic or A
 
 MODEL_PATH = "voice_deepfake_model.pkl"
 
-# OPTIONAL: Replace this URL with your own direct download link if you host it elsewhere
-# (Ensure the URL ends with a direct download action, not a web preview page)
-MODEL_URL = "https://github.com/your-username/your-repo-name/releases/download/v1.0/voice_deepfake_model.pkl"
-
-@st.cache_resource
-def download_and_load_model():
-    """Downloads the model file from a URL if it doesn't exist locally, then loads it."""
-    if not os.path.exists(MODEL_PATH):
-        with st.spinner("Downloading pre-trained model matrix from cloud storage... Please wait."):
-            try:
-                urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-                st.success("Model downloaded successfully!")
-            except Exception as e:
-                st.error(f"Failed to download model file automatically. Error: {e}")
-                st.stop()
-                
-    with open(MODEL_PATH, 'rb') as file:
-        return pickle.load(file)
-
 def extract_features(file_path, max_pad_len=40):
+    """Extracts MFCC features from an audio file."""
     try:
         audio, sample_rate = librosa.load(file_path, sr=16000, res_type='kaiser_fast')
         mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
@@ -42,47 +26,100 @@ def extract_features(file_path, max_pad_len=40):
         else:
             mfccs = mfccs[:, :max_pad_len]
         return mfccs.flatten()
-    except Exception as e:
+    except Exception:
         return None
 
-# Load the model via the download wrapper
-try:
-    model = download_and_load_model()
-except Exception as e:
-    st.error("Could not load the model file. Ensure it was trained and serialized correctly.")
-    st.stop()
-
-# File Uploader
-uploaded_file = st.file_uploader("Choose an audio file...", type=["wav", "mp3"])
-
-if uploaded_file is not None:
-    st.audio(uploaded_file, format='audio/wav')
-    
-    temp_filename = "temp_user_input.wav"
-    with open(temp_filename, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+def train_model_on_cloud():
+    """Downloads a small slice of the dataset and trains the model directly on the cloud safely."""
+    try:
+        # 1. Download dataset via kagglehub
+        dataset_path = kagglehub.dataset_download("birdy654/deep-voice-deepfake-voice-recognition")
         
-    with st.spinner("Analyzing audio frequencies..."):
-        features = extract_features(temp_filename)
+        features = []
+        labels = []
         
-        if features is not None:
-            features = features.reshape(1, -1)
-            prediction = model.predict(features)[0]
-            probabilities = model.predict_proba(features)[0]
-            classes = model.classes_
+        # 2. Extract features from a small sample size (50 real, 50 fake) to avoid cloud timeouts
+        for label_type in ['REAL', 'FAKE']:
+            search_path = os.path.join(dataset_path, '**', label_type, '*.wav')
+            file_list = glob.glob(search_path, recursive=True)
             
-            pred_idx = np.where(classes == prediction)[0][0]
-            confidence = probabilities[pred_idx] * 100
+            if not file_list:
+                search_path = os.path.join(dataset_path, '**', label_type.lower(), '*.wav')
+                file_list = glob.glob(search_path, recursive=True)
             
-            st.markdown("---")
-            st.subheader("Analysis Verdict:")
+            # Use a max of 50 files per class for high-speed cloud generation
+            for file_path in file_list[:50]:
+                data = extract_features(file_path)
+                if data is not None:
+                    features.append(data)
+                    labels.append(label_type)
+
+        if len(features) == 0:
+            raise ValueError("No audio files could be processed.")
+
+        # 3. Train a lightweight Random Forest model
+        X = np.array(features)
+        y = np.array(labels)
+        
+        clf = RandomForestClassifier(n_estimators=50, random_state=42)
+        clf.fit(X, y)
+        
+        # 4. Save the model locally in the cloud container
+        with open(MODEL_PATH, 'wb') as file:
+            pickle.dump(clf, file)
             
-            if prediction == "REAL":
-                st.success(f"✅ **REAL**: The audio belongs to an actual human. (Confidence: {confidence:.2f}%)")
+        return clf
+    except Exception as e:
+        st.error(f"Cloud training pipeline failed: {e}")
+        return None
+
+# Load or Train the model dynamically
+@st.cache_resource
+def load_or_train_classifier():
+    if os.path.exists(MODEL_PATH):
+        with open(MODEL_PATH, 'rb') as file:
+            return pickle.load(file)
+    else:
+        with st.spinner("First-time setup: Downloading dataset slice & building AI model... This takes about 30 seconds."):
+            return train_model_on_cloud()
+
+# Initialize model
+model = load_or_train_classifier()
+
+if model is not None:
+    # File Uploader UI
+    uploaded_file = st.file_uploader("Choose a verification audio file...", type=["wav", "mp3"])
+
+    if uploaded_file is not None:
+        st.audio(uploaded_file, format='audio/wav')
+        
+        temp_filename = "temp_user_input.wav"
+        with open(temp_filename, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+            
+        with st.spinner("Analyzing spectral patterns..."):
+            features = extract_features(temp_filename)
+            
+            if features is not None:
+                features = features.reshape(1, -1)
+                prediction = model.predict(features)[0]
+                probabilities = model.predict_proba(features)[0]
+                classes = model.classes_
+                
+                pred_idx = np.where(classes == prediction)[0][0]
+                confidence = probabilities[pred_idx] * 100
+                
+                st.markdown("---")
+                st.subheader("Analysis Verdict:")
+                
+                if prediction == "REAL":
+                    st.success(f"✅ **REAL**: The audio belongs to an actual human. (Confidence: {confidence:.2f}%)")
+                else:
+                    st.error(f"🚨 **FAKE**: The audio is a synthetic, deepfake voice generated by AI. (Confidence: {confidence:.2f}%)")
             else:
-                st.error(f"🚨 **FAKE**: The audio is a synthetic, deepfake voice generated by AI. (Confidence: {confidence:.2f}%)")
-        else:
-            st.error("Could not process audio format.")
-            
-    if os.path.exists(temp_filename):
-        os.remove(temp_filename)
+                st.error("Could not process audio data format.")
+                
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+else:
+    st.error("System initialization failed. Review logs for details.")
