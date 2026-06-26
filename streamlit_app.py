@@ -1,6 +1,7 @@
 import streamlit as st
 import pickle
 import os
+import glob
 import pandas as pd
 import numpy as np
 import librosa
@@ -13,54 +14,62 @@ st.set_page_config(page_title="Deepfake Voice Detector", page_icon="🎙️", la
 st.title("🎙️ AI Deepfake Voice Recognition")
 st.write("Upload an audio sample below to verify if the speech is authentic or AI-generated synthetic media.")
 
-MODEL_PATH = "voice_deepfake_model.pkl"
+MODEL_PATH = "voice_deepfake_model_v2.pkl"
+NUM_FEATURES = 1000  # Number of fixed numeric sequence points for the model
 
-def extract_features(file_path, max_pad_len=40):
-    """Extracts MFCC features from an audio file uploaded by the user."""
+def process_audio_signal(file_path, target_length=NUM_FEATURES):
+    """Loads an audio file and converts it into a uniform dimensional feature sequence."""
     try:
-        audio, sample_rate = librosa.load(file_path, sr=16000, res_type='kaiser_fast')
-        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
-        if mfccs.shape[1] < max_pad_len:
-            pad_width = max_pad_len - mfccs.shape[1]
-            mfccs = np.pad(mfccs, pad_width=((0, 0), (0, pad_width)), mode='constant')
+        # Load raw sample rate points directly
+        audio, _ = librosa.load(file_path, sr=8000, res_type='kaiser_fast')
+        
+        # Clip or pad array points to achieve identical column dimensions
+        if len(audio) > target_length:
+            features = audio[:target_length]
         else:
-            mfccs = mfccs[:, :max_pad_len]
-        return mfccs.flatten()
+            features = np.pad(audio, (0, target_length - len(audio)), 'constant')
+        return features
     except Exception:
         return None
 
-def train_model_from_csv():
-    """Finds DATASET-balanced.csv in the dataset path and trains the classifier instantly."""
+def train_structural_model():
+    """Downloads the raw audio repository slice and builds a fast spatial signal model."""
     try:
-        # 1. Download dataset via kagglehub
+        # 1. Download source files via kagglehub
+        st.info("Downloading training samples from Kaggle hub...")
         dataset_path = kagglehub.dataset_download("birdy654/deep-voice-deepfake-voice-recognition")
         
-        # 2. Search for the pre-extracted CSV file in the directory
-        csv_file = None
-        for root, dirs, files in os.walk(dataset_path):
-            for file in files:
-                if file.endswith("DATASET-balanced.csv") or file.endswith(".csv"):
-                    csv_file = os.path.join(root, file)
-                    break
+        features = []
+        labels = []
         
-        if not csv_file:
-            raise FileNotFoundError("Could not locate the pre-extracted CSV feature file in the dataset.")
+        # 2. Extract balanced sequences directly from source audio directories 
+        for label_type in ['REAL', 'FAKE']:
+            # Handle directory patterns
+            search_path = os.path.join(dataset_path, '**', label_type, '*.wav')
+            file_list = glob.glob(search_path, recursive=True)
             
-        # 3. Load the data matrix
-        df = pd.read_csv(csv_file)
+            if not file_list:
+                search_path = os.path.join(dataset_path, '**', label_type.lower(), '*.wav')
+                file_list = glob.glob(search_path, recursive=True)
+            
+            # Extract 40 fast sequence samples per type for rapid cloud compilation
+            for file_path in file_list[:40]:
+                sig_features = process_audio_signal(file_path)
+                if sig_features is not None:
+                    features.append(sig_features)
+                    labels.append(label_type)
+
+        if len(features) == 0:
+            raise ValueError("Kaggle directory parsing failed. Could not locate .wav files.")
+
+        # 3. Train Classifier Matrix
+        X = np.array(features)
+        y = np.array(labels)
         
-        # Standardize target column tracking (usually 'label' or 'class')
-        target_col = 'label' if 'label' in df.columns else ('class' if 'class' in df.columns else df.columns[-1])
-        
-        # Clean up strings or categorical representations if necessary
-        X = df.drop(columns=[target_col]).select_dtypes(include=[np.number]).values
-        y = df[target_col].astype(str).str.upper().values # Ensures consistent "REAL" / "FAKE" strings
-        
-        # 4. Train a fast Random Forest model
-        clf = RandomForestClassifier(n_estimators=50, random_state=42)
+        clf = RandomForestClassifier(n_estimators=60, random_state=42)
         clf.fit(X, y)
         
-        # 5. Save the model locally in the cloud container
+        # 4. Save model 
         with open(MODEL_PATH, 'wb') as file:
             pickle.dump(clf, file)
             
@@ -69,21 +78,20 @@ def train_model_from_csv():
         st.error(f"Cloud training pipeline failed: {e}")
         return None
 
-# Load or Train the model dynamically
+# Caching logic
 @st.cache_resource
-def load_or_train_classifier():
+def load_structural_classifier():
     if os.path.exists(MODEL_PATH):
         with open(MODEL_PATH, 'rb') as file:
             return pickle.load(file)
     else:
-        with st.spinner("First-time setup: Reading pre-built features & building AI model..."):
-            return train_model_from_csv()
+        return train_structural_model()
 
-# Initialize model
-model = load_or_train_classifier()
+# Initialize the workspace
+model = load_structural_classifier()
 
 if model is not None:
-    # File Uploader UI
+    # User File Upload
     uploaded_file = st.file_uploader("Choose a verification audio file...", type=["wav", "mp3"])
 
     if uploaded_file is not None:
@@ -94,19 +102,14 @@ if model is not None:
             f.write(uploaded_file.getbuffer())
             
         with st.spinner("Analyzing spectral patterns..."):
-            features = extract_features(temp_filename)
+            user_features = process_audio_signal(temp_filename)
             
-            if features is not None:
-                # Ensure user feature length matches what the CSV model expects
-                expected_features = model.n_features_in_
-                if len(features) > expected_features:
-                    features = features[:expected_features]
-                elif len(features) < expected_features:
-                    features = np.pad(features, (0, expected_features - len(features)), 'constant')
-                    
-                features = features.reshape(1, -1)
-                prediction = model.predict(features)[0]
-                probabilities = model.predict_proba(features)[0]
+            if user_features is not None:
+                user_features = user_features.reshape(1, -1)
+                
+                # Predict
+                prediction = model.predict(user_features)[0]
+                probabilities = model.predict_proba(user_features)[0]
                 classes = model.classes_
                 
                 pred_idx = np.where(classes == prediction)[0][0]
@@ -115,14 +118,14 @@ if model is not None:
                 st.markdown("---")
                 st.subheader("Analysis Verdict:")
                 
-                if "REAL" in prediction:
+                if prediction == "REAL":
                     st.success(f"✅ **REAL**: The audio belongs to an actual human. (Confidence: {confidence:.2f}%)")
                 else:
                     st.error(f"🚨 **FAKE**: The audio is a synthetic, deepfake voice generated by AI. (Confidence: {confidence:.2f}%)")
             else:
-                st.error("Could not process audio data format.")
+                st.error("Error analyzing your uploaded audio structure. Ensure it is a valid audio file.")
                 
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
 else:
-    st.error("System initialization failed. Review logs for details.")
+    st.error("Unable to compile model backend. Check application log entries.")
