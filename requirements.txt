@@ -1,0 +1,7 @@
+streamlit
+kagglehub
+librosa
+soundfile
+scikit-learn
+numpy
+pandas
