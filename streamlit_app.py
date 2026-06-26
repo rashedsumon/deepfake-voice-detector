@@ -1,7 +1,7 @@
 import streamlit as st
 import pickle
 import os
-import glob
+import pandas as pd
 import numpy as np
 import librosa
 import kagglehub
@@ -16,7 +16,7 @@ st.write("Upload an audio sample below to verify if the speech is authentic or A
 MODEL_PATH = "voice_deepfake_model.pkl"
 
 def extract_features(file_path, max_pad_len=40):
-    """Extracts MFCC features from an audio file."""
+    """Extracts MFCC features from an audio file uploaded by the user."""
     try:
         audio, sample_rate = librosa.load(file_path, sr=16000, res_type='kaiser_fast')
         mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
@@ -29,42 +29,38 @@ def extract_features(file_path, max_pad_len=40):
     except Exception:
         return None
 
-def train_model_on_cloud():
-    """Downloads a small slice of the dataset and trains the model directly on the cloud safely."""
+def train_model_from_csv():
+    """Finds DATASET-balanced.csv in the dataset path and trains the classifier instantly."""
     try:
         # 1. Download dataset via kagglehub
         dataset_path = kagglehub.dataset_download("birdy654/deep-voice-deepfake-voice-recognition")
         
-        features = []
-        labels = []
+        # 2. Search for the pre-extracted CSV file in the directory
+        csv_file = None
+        for root, dirs, files in os.walk(dataset_path):
+            for file in files:
+                if file.endswith("DATASET-balanced.csv") or file.endswith(".csv"):
+                    csv_file = os.path.join(root, file)
+                    break
         
-        # 2. Extract features from a small sample size (50 real, 50 fake) to avoid cloud timeouts
-        for label_type in ['REAL', 'FAKE']:
-            search_path = os.path.join(dataset_path, '**', label_type, '*.wav')
-            file_list = glob.glob(search_path, recursive=True)
+        if not csv_file:
+            raise FileNotFoundError("Could not locate the pre-extracted CSV feature file in the dataset.")
             
-            if not file_list:
-                search_path = os.path.join(dataset_path, '**', label_type.lower(), '*.wav')
-                file_list = glob.glob(search_path, recursive=True)
-            
-            # Use a max of 50 files per class for high-speed cloud generation
-            for file_path in file_list[:50]:
-                data = extract_features(file_path)
-                if data is not None:
-                    features.append(data)
-                    labels.append(label_type)
-
-        if len(features) == 0:
-            raise ValueError("No audio files could be processed.")
-
-        # 3. Train a lightweight Random Forest model
-        X = np.array(features)
-        y = np.array(labels)
+        # 3. Load the data matrix
+        df = pd.read_csv(csv_file)
         
+        # Standardize target column tracking (usually 'label' or 'class')
+        target_col = 'label' if 'label' in df.columns else ('class' if 'class' in df.columns else df.columns[-1])
+        
+        # Clean up strings or categorical representations if necessary
+        X = df.drop(columns=[target_col]).select_dtypes(include=[np.number]).values
+        y = df[target_col].astype(str).str.upper().values # Ensures consistent "REAL" / "FAKE" strings
+        
+        # 4. Train a fast Random Forest model
         clf = RandomForestClassifier(n_estimators=50, random_state=42)
         clf.fit(X, y)
         
-        # 4. Save the model locally in the cloud container
+        # 5. Save the model locally in the cloud container
         with open(MODEL_PATH, 'wb') as file:
             pickle.dump(clf, file)
             
@@ -80,8 +76,8 @@ def load_or_train_classifier():
         with open(MODEL_PATH, 'rb') as file:
             return pickle.load(file)
     else:
-        with st.spinner("First-time setup: Downloading dataset slice & building AI model... This takes about 30 seconds."):
-            return train_model_on_cloud()
+        with st.spinner("First-time setup: Reading pre-built features & building AI model..."):
+            return train_model_from_csv()
 
 # Initialize model
 model = load_or_train_classifier()
@@ -101,6 +97,13 @@ if model is not None:
             features = extract_features(temp_filename)
             
             if features is not None:
+                # Ensure user feature length matches what the CSV model expects
+                expected_features = model.n_features_in_
+                if len(features) > expected_features:
+                    features = features[:expected_features]
+                elif len(features) < expected_features:
+                    features = np.pad(features, (0, expected_features - len(features)), 'constant')
+                    
                 features = features.reshape(1, -1)
                 prediction = model.predict(features)[0]
                 probabilities = model.predict_proba(features)[0]
@@ -112,7 +115,7 @@ if model is not None:
                 st.markdown("---")
                 st.subheader("Analysis Verdict:")
                 
-                if prediction == "REAL":
+                if "REAL" in prediction:
                     st.success(f"✅ **REAL**: The audio belongs to an actual human. (Confidence: {confidence:.2f}%)")
                 else:
                     st.error(f"🚨 **FAKE**: The audio is a synthetic, deepfake voice generated by AI. (Confidence: {confidence:.2f}%)")
